@@ -19,6 +19,7 @@ import json
 import hashlib
 import argparse
 import tempfile
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 import numpy as np
@@ -46,7 +47,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from pixellib.semantic import semantic_segmentation, ade20k_map_color_mask, labelAde20k_to_color_image
+from pixellib.semantic import (semantic_segmentation, ade20k_map_color_mask,
+                              labelAde20k_to_color_image, create_ade20k_label_namemap)
 
 # ---------------------------------------------------------------------------
 # Fixed scientific configuration
@@ -62,6 +64,15 @@ DEFAULT_SVF_RINGS = 120
 EXPECTED_PHASES = ("BikeG", "BikeU", "WalkG", "WalkU", "Tram")
 MATCHED_SECONDS = 480.0
 MATCHED_PARTICIPANTS = ("P4", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P17")
+# Tram is now part of the canonical ceiling-inclusive SVF outputs.
+# Keep this empty so Tram values are retained in merged and 10-second tables.
+SVF_PENDING_PHASES = set()
+SVF_MEASUREMENT_FIELDS = [
+    "Sky_%", "SVF_Holmer", "Tree_%", "Plant_%", "Grass_%",
+    "Combined_Vegetation_%", "Building_%", "Wall_%", "Ceiling_%",
+    "Manual_Sky_IoU", "Manual_Sky_Dice", "Manual_Pixel_Accuracy",
+    "Manual_SVF_Holmer", "SVF_Abs_Error_vs_Manual",
+]
 
 # ---------------------------------------------------------------------------
 # In-Memory Dynamic Loader for Colleague's MSE-SkyViewFactor-master (Read-Only)
@@ -325,18 +336,214 @@ def trim_svf_to_matched_8min(df: pd.DataFrame, key_df: pd.DataFrame, pid: str, p
     return df.loc[keep].copy()
 
 
-def write_merged_matched_svf() -> Path | None:
-    """Write one merged matched table only when all 11 canonical participants exist."""
-    files = [OUTPUT_ROOT / pid / f"{pid}_SVF_matched_8min.csv" for pid in MATCHED_PARTICIPANTS]
+def _write_merged_svf_table(stem: str, filename: str) -> Path | None:
+    """Concatenate canonical per-participant SVF tables when all 11 exist."""
+    files = [OUTPUT_ROOT / pid / f"{pid}_SVF{stem}.csv" for pid in MATCHED_PARTICIPANTS]
     if not all(path.is_file() for path in files):
         return None
     merged = pd.concat((pd.read_csv(path) for path in files), ignore_index=True)
+    pending = merged["PhaseID"].isin(SVF_PENDING_PHASES)
+    fields = [c for c in SVF_MEASUREMENT_FIELDS if c in merged]
+    merged.loc[pending, fields] = np.nan
     merged = merged.sort_values(["ParticipantID", "PhaseID", "Timestamp", "Filename"], na_position="last")
-    output = OUTPUT_ROOT / "merged_SVF_matched_8min.csv"
-    temporary = OUTPUT_ROOT / ".merged_SVF_matched_8min.tmp.csv"
+    output = OUTPUT_ROOT / filename
+    temporary = OUTPUT_ROOT / f".{filename}.tmp.csv"
     merged.to_csv(temporary, index=False)
     os.replace(temporary, output)
     return output
+
+
+def write_merged_svf() -> Path | None:
+    """Write one merged full-phase table only when all 11 canonical participants exist."""
+    return _write_merged_svf_table("", "merged_SVF.csv")
+
+
+def write_merged_matched_svf() -> Path | None:
+    """Write one merged matched table only when all 11 canonical participants exist."""
+    return _write_merged_svf_table("_matched_8min", "merged_SVF_matched_8min.csv")
+
+
+#10 sec outputs
+SVF_SELECTION_METHOD = "max_retained_class_coverage_key_anchored_midpoint_tiebreak"
+
+
+def select_svf_10sec_frames(data, key_df, source_mode, aggregation="best"):
+    if source_mode not in {"full", "matched_8min"}:
+        raise ValueError(f"Invalid SVF source mode: {source_mode}")
+    if aggregation not in {"best", "avg"}:
+        raise ValueError(f"Invalid aggregation: {aggregation}")
+    fields = ["Sky_%", "Tree_%", "Plant_%", "Grass_%", "Building_%", "Wall_%", "Ceiling_%"]
+    working = data.copy()
+    working["_timestamp"] = pd.to_datetime(working["Timestamp"], errors="raise")
+    if working[["ParticipantID", "PhaseID", "Filename", "_timestamp"]].isna().any().any():
+        raise ValueError("Missing SVF selection keys")
+    if working.duplicated(["ParticipantID", "PhaseID", "_timestamp"]).any():
+        raise ValueError("Duplicate SVF participant/phase/timestamp")
+    shares = working[fields].apply(pd.to_numeric, errors="raise")
+    # Older archive inputs still contain blank pending Tram measurements.
+    pending = working["PhaseID"].isin(SVF_PENDING_PHASES) | (
+        working["PhaseID"].eq("Tram") & shares[fields].isna().all(axis=1))
+    if not np.isfinite(shares.loc[~pending].to_numpy()).all() or (shares.loc[~pending] < 0).any().any():
+        raise ValueError("SVF selection requires finite nonnegative class percentages")
+    measurement_fields = [c for c in SVF_MEASUREMENT_FIELDS if c in working]
+    working.loc[pending, measurement_fields] = np.nan
+    if (shares.loc[~pending].sum(axis=1) > 100 + 1e-6).any():
+        raise ValueError("Retained-class sum exceeds 100%")
+    frames = []
+    for (pid, phase), group in working.groupby(["ParticipantID", "PhaseID"], sort=False):
+        if pid not in key_df.index:
+            raise ValueError(f"No key.csv row for {pid}")
+        row = key_df.loc[pid]
+        dates = group["_timestamp"].dt.strftime("%d-%b").str.lower()
+        matching = group.loc[dates.eq(str(row["Date"]).lower()), "_timestamp"]
+        if matching.empty:
+            raise ValueError(f"SVF date disagrees with key.csv for {pid}/{phase}")
+        date = matching.iloc[0].date()
+        start = pd.Timestamp(datetime.combine(date, datetime.strptime(str(row[f"{phase}_start"]), "%H:%M:%S").time()))
+        end = (start + pd.Timedelta(seconds=MATCHED_SECONDS) if source_mode == "matched_8min"
+               else pd.Timestamp(datetime.combine(date, datetime.strptime(str(row[f"{phase}_end"]), "%H:%M:%S").time())))
+        if end <= start:
+            end += pd.Timedelta(days=1)
+        group = group.loc[group["_timestamp"].ge(start) & group["_timestamp"].lt(end)].copy()
+        group["SVF_Window_Start_s"] = ((group["_timestamp"] - start).dt.total_seconds() // 10).astype(int) * 10
+        group["SVF_Window_Start"] = start + pd.to_timedelta(group["SVF_Window_Start_s"], unit="s")
+        group["_mid_distance"] = (group["_timestamp"] - (group["SVF_Window_Start"] + pd.Timedelta(seconds=5))).abs()
+        group["SVF_Frames_In_Window"] = group.groupby("SVF_Window_Start_s")["Filename"].transform("size")
+        frames.append(group)
+    if not frames:
+        raise ValueError("No SVF frames eligible for selection")
+    working = pd.concat(frames, ignore_index=True)
+    keys = ["ParticipantID", "PhaseID", "SVF_Window_Start_s"]
+    ordered = working.sort_values(keys + ["_mid_distance", "_timestamp", "Filename"], kind="stable")
+    if aggregation == "best":
+        coverage = ordered[fields].sum(axis=1, min_count=len(fields))
+        ordered = ordered.loc[coverage.sort_values(ascending=False, kind="stable").index]
+    selected = ordered.drop_duplicates(keys).copy()
+    selected["SVF_Selection_Method"] = SVF_SELECTION_METHOD
+    selected["SVF_Aggregation_Method"] = aggregation
+    if aggregation == "avg":
+        selected = selected.set_index(keys)
+        # Average the measurements, not labels or the metadata of one image.
+        averages = [c for c in SVF_MEASUREMENT_FIELDS if c in working and not c.startswith("Manual_")
+                    and c != "SVF_Abs_Error_vs_Manual"]
+        means = working.groupby(keys)[averages].mean()
+        selected[averages] = means
+        for column in selected.columns:
+            if column in averages or column in {"SVF_Window_Start",
+                    "SVF_Frames_In_Window", "SVF_Selection_Method", "SVF_Aggregation_Method",
+                    "_timestamp", "_mid_distance", "Timestamp"}:
+                continue
+            # Retain only metadata identical for every contributing frame.
+            constant = working.groupby(keys)[column].nunique(dropna=False).eq(1)
+            if pd.api.types.is_bool_dtype(selected[column].dtype):
+                selected[column] = selected[column].astype(object)
+            selected.loc[~constant, column] = np.nan
+        for column in ["Filename", "Image_Path", "Segmented_Image_Path", "Manual_Mask_Path"]:
+            if column in selected:
+                selected[column] = ""
+        for column in [c for c in SVF_MEASUREMENT_FIELDS if c in selected and c not in averages]:
+            selected[column] = np.nan
+        selected["Timestamp"] = selected["SVF_Window_Start"]
+        selected["SVF_Selection_Method"] = "mean_available_frames_key_anchored"
+        selected = selected.reset_index()
+    return selected.drop(columns=["_timestamp", "_mid_distance"]).sort_values(keys).reset_index(drop=True)
+
+
+def update_svf_class_table(records, output_root):
+    """Save complete model class percentages without altering their values."""
+    names = create_ade20k_label_namemap()
+    labels = [names[i] for i in range(151)]
+    keys = ["ParticipantID", "PhaseID", "Filename"]
+    incoming = pd.DataFrame(records)
+    if incoming.empty:
+        return
+    if not set(labels + keys).issubset(incoming.columns):
+        raise ValueError("Full-class export requires all 151 labels")
+    if (not np.isfinite(incoming[labels].to_numpy()).all()
+            or (incoming[labels] < 0).any().any()
+            or not np.allclose(incoming[labels].sum(axis=1), 100, atol=1e-8, rtol=0)):
+        raise ValueError("Full-class export does not total 100%")
+    output = output_root / "151_classes_SVF.csv"
+    if output.exists():
+        existing = pd.read_csv(output)
+        if not set(labels).issubset(existing) or existing[labels].isna().any().any():
+            raise ValueError("Existing 151-class file is not a complete label table")
+        incoming = pd.concat([existing, incoming], ignore_index=True)
+    incoming = incoming.drop_duplicates(keys, keep="last").sort_values(keys)
+    temporary = output.with_suffix(".tmp.csv")
+    incoming.to_csv(temporary, index=False)
+    os.replace(temporary, output)
+
+
+def write_svf_class_exports(output_root=OUTPUT_ROOT, data=None):
+    """Check all 151 model classes against the selected-class measurements."""
+    if data is None:
+        data = pd.read_csv(output_root / "merged_SVF.csv")
+    keys = ["ParticipantID", "PhaseID", "Filename"]
+    fields = ["Sky_%", "Tree_%", "Plant_%", "Grass_%", "Building_%", "Wall_%", "Ceiling_%"]
+    retained = data[keys + fields].copy()
+    values = retained[fields].to_numpy()
+    if not np.isfinite(values).all() or (values < 0).any():
+        raise ValueError("Selected-class percentages must be finite and nonnegative")
+    output = output_root / "retained_classes_SVF.csv"
+    temporary = output.with_suffix(".tmp.csv")
+    cache = output_root / "151_classes_SVF.csv"
+    if not cache.exists():
+        raise ValueError("151-class export missing; original labels must be recovered")
+    classes = pd.read_csv(cache)
+    names = create_ade20k_label_namemap()
+    labels = [names[i] for i in range(151)]
+    if classes.duplicated(keys).any() or not np.isfinite(classes[labels].to_numpy()).all():
+        raise ValueError("151-class export has duplicate keys or missing labels")
+    if (classes[labels] < 0).any().any():
+        raise ValueError("151-class export contains negative percentages")
+    if not np.allclose(classes[labels].sum(axis=1), 100, atol=1e-8, rtol=0):
+        raise ValueError("151-class export does not total 100%")
+    wanted = pd.MultiIndex.from_frame(data[keys])
+    indexed = classes.set_index(keys)
+    if not wanted.isin(indexed.index).all():
+        raise ValueError("151-class export is missing images; do not reuse stale data")
+    classes = indexed.loc[wanted].reset_index()
+    comparison = {"sky": "Sky_%", "tree": "Tree_%", "plant": "Plant_%",
+                  "grass": "Grass_%", "building": "Building_%", "wall": "Wall_%",
+                  "ceiling": "Ceiling_%"}
+    for label, column in comparison.items():
+        if not np.allclose(classes[label].to_numpy(), data[column].to_numpy(), atol=1e-8, rtol=0):
+            raise ValueError(f"Full-class export disagrees with merged {column}")
+    omitted = [label for label in labels if label not in comparison]
+    retained["Other_%"] = classes[omitted].sum(axis=1).to_numpy()
+    retained.to_csv(temporary, index=False)
+    os.replace(temporary, output)
+    classes.to_csv(cache.with_suffix(".tmp.csv"), index=False)
+    os.replace(cache.with_suffix(".tmp.csv"), cache)
+    print(f"Class exports: {cache} and {output}", flush=True)
+
+
+def write_merged_svf_10sec(output_root=OUTPUT_ROOT):
+    """Postprocess existing merged CSVs only; this function does not run inference."""
+    key_df = load_phase_key(KEY_CSV)
+    paths = []
+    full_data = None
+    for stem, mode in [("merged_SVF", "full"), ("merged_SVF_matched_8min", "matched_8min")]:
+        source = output_root / f"{stem}.csv"
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        data = pd.read_csv(source)
+        if mode == "full":
+            full_data = data
+        for aggregation in ("best", "avg"):
+            result = select_svf_10sec_frames(data, key_df, mode, aggregation)
+            output = output_root / f"{stem}_10sec_{aggregation}.csv"
+            temporary = output.with_suffix(".tmp.csv")
+            result.to_csv(temporary, index=False)
+            os.replace(temporary, output)
+            print(f"10 sec {aggregation} output: {output} ({len(result)} windows)", flush=True)
+            paths.append(output)
+    if (output_root / "151_classes_SVF.csv").exists():
+        write_svf_class_exports(output_root, data=full_data)
+    elif output_root.resolve() == OUTPUT_ROOT.resolve():
+        raise ValueError("Canonical full-class cache missing; cannot export stale class results")
+    return paths
 
 
 def resolve_session_dir(phase_ucm_dir: Path) -> Path:
@@ -417,6 +624,7 @@ def save_overlay(out_file, input_bgr, labels, eval_mask, eval_center, eval_radiu
 # Main Execution Pipeline
 # ---------------------------------------------------------------------------
 def main():
+    class_export_buffer = []
     parser = argparse.ArgumentParser(description="CamUp SVF Pipeline (Xception/ADE20K + Holmer 1992)")
     parser.add_argument("--participant", default="P4", help="Participant ID")
     parser.add_argument("--phase", default="all", help="Phase ID, list, or 'all'")
@@ -441,6 +649,8 @@ def main():
     parser.add_argument("--manual-mask-coordinate-system", choices=["rectified", "raw-fisheye"], default=None)
     parser.add_argument("--allow-partial", action="store_true")
     parser.add_argument("--batch-size", type=int, default=6)
+    parser.add_argument("--output-root", type=Path, default=OUTPUT_ROOT,
+                        help="Separate output root; original default remains unchanged.")
     args = parser.parse_args()
 
     # Pre-flight validations
@@ -546,9 +756,10 @@ def main():
         "manual_mask_used": args.manual_mask_dir is not None,
         "manual_mask_coordinate_system": args.manual_mask_coordinate_system,
     }
+    run_config["include_ceiling"] = True
     run_sig = hashlib.sha256(json.dumps(run_config, sort_keys=True).encode()).hexdigest()
 
-    out_participant_dir = OUTPUT_ROOT / pid
+    out_participant_dir = args.output_root / pid
     out_participant_dir.mkdir(parents=True, exist_ok=True)
     if phase.lower() == "all" and args.limit is None and args.step == 1:
         suffix = ""
@@ -614,6 +825,7 @@ def main():
             print(f"\nPhase {ph}: {len(images)} total frames | {len(pending)} pending to process.", flush=True)
 
             batch_size = max(1, args.batch_size)
+            phase_t0 = time.monotonic()
             for b_start in range(0, len(pending), batch_size):
                 batch_paths = pending[b_start : b_start + batch_size]
                 batch_tensors, batch_items = [], []
@@ -668,6 +880,12 @@ def main():
                     _, objs = ade20k_map_color_mask(labels, extract_segmented_objects=True)
                     cls_masks = union_class_masks(objs, itm["crop"].shape[:2], itm["mask"])
                     pcts = {k: (cv2.countNonZero(m) / float(itm["area"])) * 100.0 for k, m in cls_masks.items()}
+                    # Retain original label counts, not percentages reconstructed from JPEGs.
+                    name_map = create_ade20k_label_namemap()
+                    class_record = {"ParticipantID": pid, "PhaseID": ph, "Filename": itm["fn"],
+                                    "Decode_Error": "", "Class_Data_Source": "direct_model_labels"}
+                    class_record.update({name_map[i]: pcts.get(name_map[i], 0.0) for i in range(151)})
+                    class_export_buffer.append(class_record)
 
                     sky_mask = cv2.bitwise_and(cls_masks.get("sky", np.zeros(itm["crop"].shape[:2], dtype=np.uint8)), itm["mask"])
                     svf = compute_svf(sky_mask, args.svf_rings, itm["center"], itm["radius"])
@@ -714,6 +932,7 @@ def main():
                         "Tree_%": pcts.get("tree", 0.0), "Plant_%": pcts.get("plant", 0.0), "Grass_%": pcts.get("grass", 0.0),
                         "Combined_Vegetation_%": pcts.get("tree", 0.0) + pcts.get("plant", 0.0) + pcts.get("grass", 0.0),
                         "Building_%": pcts.get("building", 0.0), "Wall_%": pcts.get("wall", 0.0),
+                        "Ceiling_%": pcts.get("ceiling", 0.0),
                         "Model": "DeepLabV3+_Xception65_ADE20K", "Image_Path": str(itm["path"]),
                         "Segmented_Image_Path": str(out_img) if not args.no_save_images else "",
                         "telemetry_matched": matched,
@@ -724,9 +943,25 @@ def main():
                     processed_keys.add((ph, itm["fn"]))
 
                 if records:
+                    if len(class_export_buffer) >= 200:
+                        update_svf_class_table(class_export_buffer, args.output_root)
+                        class_export_buffer.clear()
                     pd.DataFrame(records).to_csv(partial_csv, index=False)
+                    elapsed = time.monotonic() - phase_t0
+                    attempted = min(b_start + batch_size, len(pending))
+                    rate = attempted / elapsed if elapsed > 0 else 0.0
+                    eta = (len(pending) - attempted) / rate / 60 if rate > 0 else float('inf')
+                    print(f"Progress {pid}/{ph}: {attempted}/{len(pending)} pending frames attempted | "
+                          f"{rate:.3f} frames/s | phase ETA {eta:.1f} min | "
+                          f"saved rows {len(records)} | failures {len(failures)}", flush=True)
 
+    if class_export_buffer:
+        update_svf_class_table(class_export_buffer, args.output_root)
     df_out = pd.DataFrame(records)
+    if args.output_root.resolve() == OUTPUT_ROOT.resolve() and not df_out.empty:
+        pending = df_out["PhaseID"].isin(SVF_PENDING_PHASES)
+        fields = [c for c in SVF_MEASUREMENT_FIELDS if c in df_out]
+        df_out.loc[pending, fields] = np.nan
     if not expected_keys:
         raise RuntimeError("No CamUp images were selected for this run.")
 
@@ -752,17 +987,21 @@ def main():
     matched_csv = out_participant_dir / f"{out_csv.stem}_matched_8min.csv"
     matched_partial_csv = out_participant_dir / f"{out_csv.stem}_matched_8min_PARTIAL.csv"
     merged_matched_csv = None
-    if complete_run:
+    should_promote = complete_run or (args.allow_partial and not df_out.empty)
+    if should_promote:
         matched_df = trim_svf_to_matched_8min(df_out, key_df, pid, phases)
         if matched_df.empty:
             raise RuntimeError(f"No SVF images fall inside the matched 8-minute windows for {pid}")
         matched_df.to_csv(matched_partial_csv, index=False)
         os.replace(partial_csv, out_csv)
         os.replace(matched_partial_csv, matched_csv)
-        if failure_csv.exists():
+        if complete_run and failure_csv.exists():
             failure_csv.unlink()
-        if suffix == "":
+        if suffix == "" and args.output_root.resolve() == OUTPUT_ROOT.resolve():
             merged_matched_csv = write_merged_matched_svf()
+            write_merged_svf()
+            if merged_matched_csv is not None:
+                write_merged_svf_10sec()
         result_path = out_csv
     else:
         result_path = partial_csv
@@ -777,13 +1016,13 @@ def main():
         f"missing: {len(missing_success)} | unexpected: {len(unexpected_success)}"
     )
     print(f"Output File: {result_path}")
-    if complete_run:
+    if should_promote:
         print(f"Matched 8-min output: {matched_csv} ({len(matched_df)} rows)")
         if merged_matched_csv:
             print(f"Merged matched output: {merged_matched_csv}")
     print("=" * 80)
 
-    if not complete_run and not args.allow_partial:
+    if not should_promote:
         raise RuntimeError(
             "SVF run is incomplete and was NOT promoted to canonical/pilot final output. "
             f"failures={len(failures)}, duplicate_rows={duplicate_success_rows}, "
