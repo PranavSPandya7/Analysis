@@ -14,12 +14,12 @@ Calculates the Clearness Index (k_t = G_H / G_0) using Duffie & Beckman textbook
       k_t < 0.30        -> Cloudy
 
 Inputs:
-  - C:\\Users\\pandya\\Documents\\Github\\docker\\Paper3_Github\\output\\merged_all_11participants.csv
+  - Paper3_Github/output/merged_all_11participants.csv (external, read-only input)
 
 Outputs:
-  - C:\\Users\\pandya\\Documents\\Github\\docker\\Analysis\\analysis_output\\Clearness Index\\merged_all_11participants_CI.csv
-  - C:\\Users\\pandya\\Documents\\Github\\docker\\Analysis\\analysis_output\\Clearness Index\\merged_all_11participants_8min_CI.csv
-  - C:\\Users\\pandya\\Documents\\Github\\docker\\Analysis\\analysis_output\\Clearness Index\\Participant_Clearness_Summary.csv
+  - analysis_output/Clearness Index/merged_all_11participants_CI.csv
+  - analysis_output/Clearness Index/merged_all_11participants_8min_CI.csv
+  - analysis_output/Clearness Index/Participant_Clearness_Summary.csv
 """
 
 import os
@@ -30,8 +30,9 @@ import pandas as pd
 # ==============================================================================
 # CONFIGURATION & PATHS
 # ==============================================================================
-INPUT_CSV = Path(r"C:\Users\pandya\Documents\Github\docker\Paper3_Github\output\merged_all_11participants.csv")
-OUT_DIR = Path(r"C:\Users\pandya\Documents\Github\docker\Analysis\analysis_output\Clearness Index")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+INPUT_CSV = PROJECT_ROOT.parent / "Paper3_Github" / "output" / "merged_all_11participants.csv"
+OUT_DIR = PROJECT_ROOT / "analysis_output" / "Clearness Index"
 OUT_CI_FULL = OUT_DIR / "merged_all_11participants_CI.csv"
 OUT_CI_8MIN = OUT_DIR / "merged_all_11participants_8min_CI.csv"
 OUT_SUMMARY = OUT_DIR / "Participant_Clearness_Summary.csv"
@@ -64,7 +65,7 @@ def infer_weather(kt):
 
 def add_clearness_index(df: pd.DataFrame) -> pd.DataFrame:
     """Computes extraterrestrial radiation G0, Clearness Index, and weather inference."""
-    df = df.copy()
+    df = df.drop(columns=["questionnaire_background_name"], errors="ignore").copy()
     if "Datetime" not in df.columns:
         raise ValueError("Missing 'Datetime' column in input data.")
     

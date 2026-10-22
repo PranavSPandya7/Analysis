@@ -6,6 +6,8 @@ Relies on neginja/MSE-SkyViewFactor-master for optical rectification & Holmer (1
 combined with DeepLabV3+ Xception-65 on ADE20K for semantic sky segmentation.
 """
 
+from __future__ import annotations
+
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -59,8 +61,8 @@ def load_pixel_lib():
 # ---------------------------------------------------------------------------
 MODEL_PATH = SCRIPT_DIR / "deeplabv3_xception65_ade20k.h5"
 UCM_RAW_ROOT = Path(r"C:\Users\pandya\OneDrive - UCL\Field experiment raw data\Complete Participantwise data\Final Data\ucm")
-OUTPUT_ROOT = SCRIPT_DIR.parent.parent / "output" / "SVF Output"
-KEY_CSV = SCRIPT_DIR.parent.parent / "output" / "key.csv"
+OUTPUT_ROOT = SCRIPT_DIR.parent.parent / "analysis_output" / "SVF Output"
+KEY_CSV = SCRIPT_DIR.parent.parent.parent / "Paper3_Github" / "output" / "key.csv"
 
 MSE_REFERENCE_CALIBRATION_TABLE = [24, 25, 25, 26, 26, 27, 27, 29, 29, 32, 32, 36, 36, 40, 41, 43, 44]
 MSE_REFERENCE_RADIUS_PX = float(sum(MSE_REFERENCE_CALIBRATION_TABLE))
@@ -71,7 +73,7 @@ MATCHED_PARTICIPANTS = ("P4", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P1
 # Tram is now part of the canonical ceiling-inclusive SVF outputs.
 # Keep this empty so Tram values are retained in merged and 10-second tables.
 SVF_PENDING_PHASES = set()
-# Scene class shares and totals are percent of the fisheye circle (0â€“100).
+# Scene class shares and totals are percent of the fisheye circle (0-100).
 # Total_Vegetation_% = Tree_% + Plant_% + Grass_%.
 # Total_Builtup_% = Building_% + Wall_%.
 SVF_MEASUREMENT_FIELDS = [
@@ -80,10 +82,9 @@ SVF_MEASUREMENT_FIELDS = [
 ]
 
 # ---------------------------------------------------------------------------
-# In-Memory Dynamic Loader for Colleague's MSE-SkyViewFactor-master (Read-Only)
 # ---------------------------------------------------------------------------
 def load_mse_core():
-    """Load OpticalRectifier and SkyViewFactorCalculator from colleague's -master repo."""
+    """Load OpticalRectifier and SkyViewFactorCalculator from MSE-SkyViewFactor."""
     candidates = [
         SCRIPT_DIR / "MSE-SkyViewFactor-master" / "MSE-SkyViewFactor-master" / "core",
         SCRIPT_DIR / "MSE-SkyViewFactor-master" / "core",
@@ -92,9 +93,8 @@ def load_mse_core():
     ]
     mse_core = next((c for c in candidates if c.is_dir()), None)
     if mse_core is None:
-        raise FileNotFoundError("Colleague's MSE core repository not found.")
+        raise FileNotFoundError("MSE core repository not found.")
 
-    # Mock tools dependencies required by colleague's legacy Python 2 files
     tools_mod = types.ModuleType("tools")
     sys.modules.setdefault("tools", tools_mod)
 
@@ -129,7 +129,7 @@ def load_mse_core():
 
     return rect_mod.OpticalRectifier, calc_mod.SkyViewFactorCalculator
 
-ColleagueOpticalRectifier, SkyViewFactorCalculator = load_mse_core()
+MSEOpticalRectifier, SkyViewFactorCalculator = load_mse_core()
 
 
 class OpticalRectifier:
@@ -170,7 +170,7 @@ class OpticalRectifier:
         # coordinates.  The vendored MSE implementation remains unmodified.
         scale = self.raw_radius / float(calibration_ref_radius_px)
         scaled_table = [v * scale for v in calibration_increments]
-        self._engine = ColleagueOpticalRectifier(scaled_table, 180, side, side)
+        self._engine = MSEOpticalRectifier(scaled_table, 180, side, side)
 
         self.mapping_x = np.full((self.height, self.width), -1.0, dtype=np.float32)
         self.mapping_y = np.full((self.height, self.width), -1.0, dtype=np.float32)
@@ -215,7 +215,7 @@ class OpticalRectifier:
 
 
 def compute_svf(binary_mask, number_of_steps, center, radius):
-    """Execute Holmer (1992) SVF calculation via colleague's SkyViewFactorCalculator."""
+    """Execute Holmer (1992) SVF calculation via SkyViewFactorCalculator."""
     factor = SkyViewFactorCalculator.compute_factor(binary_mask, int(number_of_steps), center, radius)
     if not np.isfinite(factor) or factor < -1e-6 or factor > 1.0 + 1e-6:
         raise RuntimeError(f"Computed invalid SVF value: {factor}")
@@ -341,6 +341,20 @@ def trim_svf_to_matched_8min(df: pd.DataFrame, key_df: pd.DataFrame, pid: str, p
     return df.loc[keep].copy()
 
 
+def normalize_svf_export_frame(data: pd.DataFrame) -> pd.DataFrame:
+    """Apply current derived totals to fresh and resumed records; drop unused empty fields."""
+    out = data.copy()
+    legacy = [c for c in ("Manual_Mask_Path", "Manual_Sky_IoU", "Manual_Sky_Dice",
+                           "Manual_Pixel_Accuracy", "Manual_SVF", "SVF_Abs_Error_vs_Manual") if c in out]
+    populated = [c for c in legacy if out[c].notna().any()]
+    if populated:
+        raise ValueError(f"Refusing to discard populated manual-validation fields: {populated}")
+    out = out.drop(columns=legacy)
+    if {"Building_%", "Wall_%"}.issubset(out.columns):
+        out["Total_Builtup_%"] = out[["Building_%", "Wall_%"]].apply(pd.to_numeric, errors="raise").sum(axis=1)
+    return out
+
+
 def _write_merged_svf_table(stem: str, filename: str) -> Path | None:
     """Concatenate canonical per-participant SVF tables when all 11 exist."""
     files = [OUTPUT_ROOT / pid / f"{pid}_SVF{stem}.csv" for pid in MATCHED_PARTICIPANTS]
@@ -352,7 +366,7 @@ def _write_merged_svf_table(stem: str, filename: str) -> Path | None:
     if missing_factors:
         print(f"Skipping merged SVF output; participant files lack TVF/BVF: {missing_factors}", flush=True)
         return None
-    merged = pd.concat((pd.read_csv(path) for path in files), ignore_index=True)
+    merged = normalize_svf_export_frame(pd.concat((pd.read_csv(path) for path in files), ignore_index=True))
     factors = merged[factor_fields].apply(pd.to_numeric, errors="coerce")
     if not np.isfinite(factors.to_numpy()).all() or ((factors < 0) | (factors > 1)).any().any():
         raise ValueError("Cannot merge missing or out-of-range SVF/TVF/BVF values.")
@@ -438,8 +452,15 @@ def write_svf_class_exports(output_root=OUTPUT_ROOT, data=None):
         raise ValueError("151-class export has duplicate keys or missing labels")
     if (classes[labels] < 0).any().any():
         raise ValueError("151-class export contains negative percentages")
-    if not np.allclose(classes[labels].sum(axis=1), 100, atol=1e-8, rtol=0):
-        raise ValueError("151-class export does not total 100%")
+    totals = classes[labels].sum(axis=1).to_numpy()
+    invalid = ~np.isclose(totals, 100, atol=1e-8, rtol=0)
+    if invalid.any():
+        examples = classes.loc[invalid, keys].head(10).to_dict("records")
+        raise ValueError(
+            f"151-class totals differ from 100% in {int(invalid.sum())} rows; "
+            f"maximum absolute difference {np.max(np.abs(totals - 100)):.12g} percentage points; "
+            f"examples: {examples}. No class exports were replaced."
+        )
     wanted = pd.MultiIndex.from_frame(data[keys])
     indexed = classes.set_index(keys)
     if not wanted.isin(indexed.index).all():
@@ -449,8 +470,15 @@ def write_svf_class_exports(output_root=OUTPUT_ROOT, data=None):
                   "grass": "Grass_%", "building": "Building_%", "wall": "Wall_%",
                   "ceiling": "Ceiling_%"}
     for label, column in comparison.items():
-        if not np.allclose(classes[label].to_numpy(), data[column].to_numpy(), atol=1e-8, rtol=0):
-            raise ValueError(f"Full-class export disagrees with merged {column}")
+        difference = np.abs(classes[label].to_numpy() - data[column].to_numpy())
+        invalid = difference > 1e-8
+        if invalid.any():
+            examples = classes.loc[invalid, keys].head(10).to_dict("records")
+            raise ValueError(
+                f"Full-class export disagrees with merged {column} in {int(invalid.sum())} rows; "
+                f"maximum absolute difference {difference.max():.12g} percentage points; "
+                f"examples: {examples}. No class exports were replaced."
+            )
     omitted = [label for label in labels if label not in comparison]
     retained["Other_%"] = classes[omitted].sum(axis=1).to_numpy()
     retained.to_csv(temporary, index=False)
@@ -516,8 +544,17 @@ def save_overlay(out_file, input_bgr, labels, eval_mask, eval_center, eval_radiu
     save_grouped_overlay(out_file, input_bgr, groups, eval_mask > 0, *values)
 
 
-def has_saved_overlay(path):
-    return path.is_file()
+def append_partial_csv_rows(path: Path, rows: list) -> None:
+    """Append checkpoint rows without rewriting the full partial CSV."""
+    if not rows:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows)
+    write_header = not path.is_file() or path.stat().st_size == 0
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        frame.to_csv(handle, index=False, header=write_header)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 # ---------------------------------------------------------------------------
@@ -674,7 +711,7 @@ def main():
         if "matched_8min" in source_csv.name or "failures" in source_csv.name:
             continue
         try:
-            source_rows = pd.read_csv(source_csv)
+            source_rows = normalize_svf_export_frame(pd.read_csv(source_csv))
         except Exception as exc:
             print(f"Ignoring unreadable existing CSV {source_csv.name}: {exc}", flush=True)
             continue
@@ -698,8 +735,9 @@ def main():
             if same_configuration:
                 existing_records[(str(row.get("PhaseID", "")), str(row.get("Filename", "")))] = row
 
+    partial_rows_on_disk = 0
     if partial_csv.is_file():
-        df_exist = pd.read_csv(partial_csv)
+        df_exist = normalize_svf_export_frame(pd.read_csv(partial_csv))
         required_resume_cols = {"PhaseID", "Filename", "Run_Config_Signature"}
         missing_resume_cols = required_resume_cols - set(df_exist.columns)
         if missing_resume_cols:
@@ -715,7 +753,15 @@ def main():
             )
         for row in df_exist.to_dict("records"):
             existing_records[(str(row["PhaseID"]), str(row["Filename"]))] = row
-        print(f"Resuming from {len(df_exist)} rows saved in {partial_csv.name}.", flush=True)
+        partial_rows_on_disk = len(df_exist)
+        print(f"Resuming from {partial_rows_on_disk} rows saved in {partial_csv.name}.", flush=True)
+
+    def flush_partial_checkpoint() -> None:
+        nonlocal partial_rows_on_disk
+        if len(records) <= partial_rows_on_disk:
+            return
+        append_partial_csv_rows(partial_csv, records[partial_rows_on_disk:])
+        partial_rows_on_disk = len(records)
 
     total_images_count = 0
     expected_keys = set()
@@ -746,8 +792,7 @@ def main():
                 key = (ph, image_path.name)
                 overlay_path = out_cam_dir / f"{image_path.stem}_svf.jpg"
                 row = existing_records.get(key)
-                if (row is not None and has_saved_overlay(overlay_path)
-                        and (pid, ph, image_path.name) in class_table.saved):
+                if row is not None and (pid, ph, image_path.name) in class_table.saved:
                     row["Segmented_Image_Path"] = str(overlay_path)
                     row["Run_Config_Signature"] = run_sig
                     records.append(row)
@@ -840,11 +885,10 @@ def main():
 
                     # Gong et al. (2018, doi:10.1016/j.buildenv.2018.02.042) use annular factors; ADE20K plant joins vegetation, wall joins buildings, ceiling stays separate.
                     out_img = out_cam_dir / f"{itm['path'].stem}_svf.jpg"
-                    if not has_saved_overlay(out_img):
-                        out_img.parent.mkdir(parents=True, exist_ok=True)
-                        title = (pcts.get("sky", 0), sum(pcts.get(k, 0) for k in ("tree", "plant", "grass")),
-                                 pcts.get("building", 0) + pcts.get("wall", 0), svf, tvf, bvf)
-                        save_overlay(out_img, itm["crop"], labels, itm["mask"], itm["center"], itm["radius"], title)
+                    out_img.parent.mkdir(parents=True, exist_ok=True)
+                    title = (pcts.get("sky", 0), sum(pcts.get(k, 0) for k in ("tree", "plant", "grass")),
+                             pcts.get("building", 0) + pcts.get("wall", 0), svf, tvf, bvf)
+                    save_overlay(out_img, itm["crop"], labels, itm["mask"], itm["center"], itm["radius"], title)
 
                     if args.save_sky_masks:
                         cv2.imwrite(str(out_participant_dir / ph / "CamUp_sky_masks" / f"{itm['path'].stem}_sky.png"), sky_mask)
@@ -883,7 +927,7 @@ def main():
                     processed_keys.add((ph, itm["fn"]))
 
                 if records:
-                    pd.DataFrame(records).to_csv(partial_csv, index=False)
+                    flush_partial_checkpoint()
                     elapsed = time.monotonic() - phase_t0
                     attempted = min(b_start + batch_size, len(pending))
                     rate = attempted / elapsed if elapsed > 0 else 0.0
@@ -892,7 +936,7 @@ def main():
                           f"{rate:.3f} frames/s | phase ETA {eta:.1f} min | "
                           f"saved rows {len(records)} | failures {len(failures)}", flush=True)
 
-    df_out = pd.DataFrame(records)
+    df_out = normalize_svf_export_frame(pd.DataFrame(records))
     if args.output_root.resolve() == OUTPUT_ROOT.resolve() and not df_out.empty:
         pending = df_out["PhaseID"].isin(SVF_PENDING_PHASES)
         fields = [c for c in SVF_MEASUREMENT_FIELDS if c in df_out]
